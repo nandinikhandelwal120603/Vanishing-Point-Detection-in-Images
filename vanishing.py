@@ -1,159 +1,195 @@
-# Import needed libraries
-import matplotlib.pyplot as plt
-import cv2  
+
 import os
-import numpy as np
-import random
+import cv2
 import math
+import numpy as np
 
-# Helper functions
+#Threshold by which lines will be rejected wrt the horizontal
 
-# Show images given a list of images
-def show_images(image):
-    plt.figure()
-    plt.imshow(image, cmap='gray')
+REJECT_DEGREE_TH = 4.0 #Also for rejecting lines based on the angles . lines with angles close to 0 or 90 degrees will be filtered out 
 
-# Load images from a folder given their filenames
-def load_images(filename):
-    try:
-        img = cv2.cvtColor(cv2.imread(filename), cv2.COLOR_BGR2RGB)
-        return img
-    except IOError:
-        print("File is not an image\n")
+
+#this function reads images from either a single file or a directory of images.
+def ReadImage(InputImagePath):
+    Images = []  # Input Images will be stored in this list.
+    ImageNames = []  # Names of input images will be stored in this list.
+
+    # Checking if path is of file or folder.
+    if os.path.isfile(InputImagePath):  # If path is of file.
+        InputImage = cv2.imread(InputImagePath)  # Reading the image.
+
+        # Checking if image is read.
+        if InputImage is None:
+            print("Image not read. Provide a correct path")
+            exit()
+
+        Images.append(InputImage)  # Storing the image.
+        ImageNames.append(os.path.basename(InputImagePath))  # Storing the image's name.
+
+    # If path is of a folder containing images.
+    elif os.path.isdir(InputImagePath):
+        # Getting all image's names present inside the folder.
+        for ImageName in os.listdir(InputImagePath):
+            # Reading images one by one.
+            InputImage = cv2.imread(os.path.join(InputImagePath, ImageName))
+
+            if InputImage is not None:
+                Images.append(InputImage)  # Storing images.
+                ImageNames.append(ImageName)  # Storing image's names.
+        
+    # If it is neither file nor folder (Invalid Path).
+    else: # Error Handling: If the path is invalid or the image can't be read, it prints an error and exits.
+        print("\nEnter valid Image Path.\n")
         exit()
 
-# Plot lines on original images 
-def show_lines(image, lines, vanishing_point=None):
-    for line in lines:
-        rho, theta = line[0]
-        a = np.cos(theta)
-        b = np.sin(theta)
-        x0 = a * rho
-        y0 = b * rho
-        pt1 = (int(x0 + 1000 * (-b)), int(y0 + 1000 * (a)))
-        pt2 = (int(x0 - 1000 * (-b)), int(y0 - 1000 * (a)))
-        cv2.line(image, pt1, pt2, (255, 0, 0), 1)
+    return Images, ImageNames
+
+# this function : helps us to find straight lines prenet in the imge that on extending will approx merge at vasnishing point 
+def FilterLines(Lines):
+    FinalLines = []
     
-    if vanishing_point:
-        for line in lines[:2]:  # Draw only the two most important lines
-            rho, theta = line[0]
-            a = np.cos(theta)
-            b = np.sin(theta)
-            x0 = a * rho
-            y0 = b * rho
-            pt1 = (int(x0 + 1000 * (-b)), int(y0 + 1000 * (a)))
-            pt2 = vanishing_point
-            cv2.line(image, pt1, pt2, (0, 255, 0), 1)
-    
-    plt.imshow(image)
-    plt.axis('off')
-    plt.show()
+    for Line in Lines:
+        [[x1, y1, x2, y2]] = Line
+
+        # Calculate slope and intercept safely
+        if x1 != x2:
+            m = (y2 - y1) / (x2 - x1)
+        else:
+            m = float('inf')  # Use infinity for vertical lines
         
-# Plot lines and points on original images 
-def show_point(image, point):
-    cv2.circle(image, point, 3, (0, 255, 0), thickness=3)
-    plt.imshow(image)
-    plt.axis('off')
-    plt.show()
+        if m == float('inf'):
+            c = x1  # For vertical lines, use x as the 'intercept'
+        else:
+            c = y1 - m * x1
 
-## 1. Detect lines in the image
-## Use the Canny edge detector and Hough transform to detect lines in the image.
+        theta = math.degrees(math.atan(m)) if m != float('inf') else 90
 
-def detect_lines(image):
-    # Do blurry to smooth the image, try to remove edges from textures
-    blur_image = cv2.GaussianBlur(image, (5, 5), 1.5)
-    # Canny edge detection with OpenCV for all blurry images
-    edge_image = cv2.Canny(blur_image, 50, 150, apertureSize=3, L2gradient=True)
-    # Use hough transform to detect all lines
-    lines = cv2.HoughLines(edge_image, 1, np.pi / 180, 100)
-    valid_lines = []
-    # Remove horizontal and vertical lines as they would not converge to vanishing point
-    for line in lines:
-        rho, theta = line[0]
-        if (theta > 0.1 and theta < 1.5) or (theta > 1.7 and theta < 3.0):
-            valid_lines.append(line)
+        # Rejecting lines of slope near to 0 degree or 90 degree and storing others
+        if REJECT_DEGREE_TH <= abs(theta) <= (90 - REJECT_DEGREE_TH):
+            l = math.sqrt((y2 - y1)**2 + (x2 - x1)**2)  # length of the line
+            FinalLines.append([x1, y1, x2, y2, m, c, l])
+
+    # Removing extra lines
+    if len(FinalLines) > 15:
+        FinalLines = sorted(FinalLines, key=lambda x: x[-1], reverse=True)
+        FinalLines = FinalLines[:15]
     
-    return blur_image, edge_image, valid_lines
+    return FinalLines
 
-### 2. Locate the vanishing point
-### Use RANSAC to locate the vanishing point from the detected lines.
 
-#### 2.1 RANSAC functions
-#### Define two functions required by RANSAC: a function to find the point where lines intersect, and a function to compute the distance from a point to a line.
+# finding lines using Probablistic hough line transform 
+# hough line transfoom : The Probabilistic Hough Transform works by randomly selecting a subset of the edge pixels in the image 
+# and then fitting lines to those pixels. 
+# This process is repeated multiple times, 
+# with the hope that each iteration will detect additional pixels that belong to the same line.
 
-# Find the intersection point
-def find_intersection_point(line1, line2):
-    # rho and theta for each line
-    rho1, theta1 = line1[0]
-    rho2, theta2 = line2[0]
-    # Used a formula from https://stackoverflow.com/a/383527/5087436 to solve for intersection between 2 lines 
-    A = np.array([
-        [np.cos(theta1), np.sin(theta1)],
-        [np.cos(theta2), np.sin(theta2)]
-    ]) 
-    b = np.array([[rho1], [rho2]])
-    det_A = np.linalg.det(A)
-    if det_A != 0:
-        x0, y0 = np.linalg.solve(A, b)
-        # Extract single elements from the array before converting
-        x0, y0 = int(np.round(x0.item())), int(np.round(y0.item()))
-        return x0, y0
-    else:
-        return None
-        
-# Find the distance from a point to a line
-def find_dist_to_line(point, line):
-    x0, y0 = point
-    rho, theta = line[0]
-    a = np.cos(theta)
-    b = np.sin(theta)
-    dist = np.abs(a * x0 + b * y0 - rho) / np.sqrt(a ** 2 + b ** 2)
-    return dist
+def GetLines(Image):
+    # step1 : Converting to grayscale --> features better detected 
+    GrayImage = cv2.cvtColor(Image, cv2.COLOR_BGR2GRAY)
+    # setp2: blurring image to reduce noise --> s that are not requiredand may lead to false positives
+    BlurGrayImage = cv2.GaussianBlur(GrayImage, (5, 5), 1)
+    # step3 : generating Edge image --> simple yet effective method of finding the edges 
+    EdgeImage = cv2.Canny(BlurGrayImage, 40, 255)
 
-#### 2.2 RANSAC loop
-#### Define the main RANSAC loop
+    
+    '''
+      edge_image (numpy.ndarray): A binary edge image (1 channel).
+      rho (int, optional): The resolution of the r parameter in pixels. Defaults to 1.
+      theta (float, optional): The resolution of the theta parameter in radians. Defaults to np.pi/180 (1 degree).
+      threshold (int, optional): The minimum number of intersections to consider a line. Defaults to 100.
+      min_line_length (int, optional): The minimum length (number of points) for a valid line. Defaults to 50.
+      max_line_gap (int, optional): The maximum allowed gap between points in a line. Defaults to 10.
 
-def RANSAC(lines, ransac_iterations, ransac_threshold, ransac_ratio):
-    inlier_count_ratio = 0.
-    vanishing_point = (0, 0)
-    # perform RANSAC iterations for each set of lines
-    for iteration in range(ransac_iterations):
-        # randomly sample 2 lines
-        selected_lines = random.sample(lines, 2)
-        line1 = selected_lines[0]
-        line2 = selected_lines[1]
-        intersection_point = find_intersection_point(line1, line2)
-        if intersection_point is not None:
-            inlier_count = 0
-            # inliers are lines whose distance to the point is less than ransac_threshold
-            for line in lines:
-                dist = find_dist_to_line(intersection_point, line)
-                if dist < ransac_threshold:
-                    inlier_count += 1
+  Returns:
+      list: A list of detected lines, where each line is represented as a tuple (x1, y1, x2, y2).
+    '''
+    
+    
+    # Finding Lines in the image
+    Lines = cv2.HoughLinesP(EdgeImage, 1, np.pi / 180, 50, 10, 15)
 
-            if inlier_count / float(len(lines)) > inlier_count_ratio:
-                inlier_count_ratio = inlier_count / float(len(lines))
-                vanishing_point = intersection_point
+    # Check if lines found and exit if not.
+    #
+    if Lines is None:
+        print("Not enough lines found in the image for Vanishing Point detection.")
+        exit(0)
+    
+    # Filtering Lines wrt angle
+    #We can filter lines based on their length in one step during the filtering stage.
+    
+    FilteredLines = FilterLines(Lines)
 
-            if inlier_count > len(lines) * ransac_ratio:
-                break
-    return vanishing_point, selected_lines
+    return FilteredLines
 
-### 3. Main function
-### Run your vanishing point detection method on a folder of images, return the (x, y) locations of the vanishing points
+def GetVanishingPoint(Lines):
+    
+    '''
+    Intersection Calculation: Find the intersection points of all pairs of lines.
+    Distance Calculation: Compute the distance from each intersection point to all other lines.
+    Error Minimization: Sum the squared distances and select the point with the minimum sum as the vanishing point.
+    '''
+    VanishingPoint = None
+    MinError = float('inf')
 
-# RANSAC parameters:
-ransac_iterations, ransac_threshold, ransac_ratio = 800, 10, 0.8
+    for i in range(len(Lines)):
+        for j in range(i+1, len(Lines)):
+            m1, c1 = Lines[i][4], Lines[i][5]
+            m2, c2 = Lines[j][4], Lines[j][5]
+
+            if m1 != m2:
+                x0 = (c1 - c2) / (m2 - m1)
+                y0 = m1 * x0 + c1
+
+                err = 0
+                for k in range(len(Lines)):
+                    m, c = Lines[k][4], Lines[k][5]
+                    if m != float('inf'):
+                        m_ = -1 / m
+                        c_ = y0 - m_ * x0
+                        x_ = (c - c_) / (m_ - m)
+                        y_ = m_ * x_ + c_
+                        l = math.sqrt((y_ - y0)**2 + (x_ - x0)**2)
+                        err += l**2
+                    else:
+                        # Handle vertical lines
+                        if c == x0:
+                            l = abs(y0 - y0)
+                            err += l**2
+
+                err = math.sqrt(err)
+
+                if MinError > err:
+                    MinError = err
+                    VanishingPoint = [x0, y0]
+                
+    return VanishingPoint
 
 if __name__ == "__main__":
-    folder_path = r"C:\Users\khand\OneDrive\Desktop\ogmen_robotics\Estimate_vanishing_points_data"
-    image_files = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
+    # update the path to the folder containing the images
+    Images, ImageNames = ReadImage("C:\\Users\\khand\\OneDrive\\Desktop\\ogmen_robotics\\Estimate_vanishing_points_data")
+    
+    for i in range(len(Images)):
+        Image = Images[i]
 
-    for image_file in image_files:
-        filename = os.path.join(folder_path, image_file)
-        print(f"Processing {filename}")
-        image = load_images(filename)
-        blur_image, edge_image, lines = detect_lines(image)
-        vanishing_point, important_lines = RANSAC(lines, ransac_iterations, ransac_threshold, ransac_ratio)
-        show_point(image, vanishing_point)
-        show_lines(image, important_lines, vanishing_point)
+        # getting the lines from the image
+        Lines = GetLines(Image)
+
+        # get vanishing point
+        VanishingPoint = GetVanishingPoint(Lines)
+
+        # checking if vanishing point found
+        if VanishingPoint is None:
+            print("Vanishing Point not found. Possible reason is that not enough lines are found in the image for determination of vanishing point.")
+            continue
+
+        # drawing lines and vanishing point
+        for Line in Lines:
+            cv2.line(Image, (Line[0], Line[1]), (Line[2], Line[3]), (0, 255, 0), 2)
+        cv2.circle(Image, (int(VanishingPoint[0]), int(VanishingPoint[1])), 10, (0, 0, 255), -1)
+        
+        # Save the final image
+        output_image_path = os.path.join("C:\\Users\\khand\\OneDrive\\Desktop\\ogmen_robotics", f"OutputImage_{i}.jpg")
+        cv2.imwrite(output_image_path, Image)
+        print(f"Image saved as {output_image_path}")
+
+#-------------------------------------------------------------------------------------------------------------------------
